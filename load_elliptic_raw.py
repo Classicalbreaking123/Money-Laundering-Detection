@@ -123,7 +123,7 @@ if __name__ == "__main__":
         features_path="data/elliptic_txs_features.csv"
     )
 
-    print("========== RAW ELLIPTIC DATA LOADED ==========")
+    print(" RAW ELLIPTIC DATA LOADED ")
     print(f"Number of nodes: {len(data.node_ids)}")
     print(f"Number of edges: {len(data.edges)}")
 
