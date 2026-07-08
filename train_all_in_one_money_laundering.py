@@ -881,10 +881,10 @@ if __name__ == "__main__":
         features_path=FEATURES_PATH
     )
 
-    print("Building graph features...")
+    print("Building graph features")
     features_df = compute_graph_features(raw_data)
 
-    print("\n========== GRAPH FEATURES BUILT ==========")
+    print("\n GRAPH FEATURES BUILT")
     print(features_df.head())
     print()
     print("Shape:", features_df.shape)
@@ -893,7 +893,7 @@ if __name__ == "__main__":
     labeled_df = features_df[features_df["label_binary"].notna()].copy()
     labeled_df["target"] = labeled_df["label_binary"].astype(int)
 
-    print("========== LABEL SUMMARY ==========")
+    print(" LABEL SUMMARY ")
     print("Total rows      :", len(features_df))
     print("Labeled rows    :", len(labeled_df))
     print("Illicit labeled :", int((labeled_df["target"] == 1).sum()))
@@ -910,7 +910,7 @@ if __name__ == "__main__":
     train_txids = set(train_df["txId"].astype(int).tolist())
     test_txids = set(test_df["txId"].astype(int).tolist())
 
-    print("========== FIXED SPLIT STATS ==========")
+    print("FIXED SPLIT STATS ")
     print("Train size     :", len(train_df))
     print("Test size      :", len(test_df))
     print("Train illicit  :", int((train_df["target"] == 1).sum()))
@@ -951,7 +951,7 @@ if __name__ == "__main__":
     with open(BASE_FEATURE_COLS_PATH, "wb") as f:
         pickle.dump(base_feature_columns, f)
 
-    print("========== TRAINING BASE MODEL ==========")
+    print(" TRAINING BASE MODEL ")
     base_model, base_best_epoch, base_best_test_loss = train_model_with_resume(
         X_train_base,
         y_train_base,
@@ -1054,7 +1054,7 @@ if __name__ == "__main__":
         }
     ]
 
-    print("========== FINAL FEATURE COLUMNS ==========")
+    print(" FINAL FEATURE COLUMNS")
     for col in final_feature_columns:
         print(col)
     print()
@@ -1077,7 +1077,7 @@ if __name__ == "__main__":
     with open(FINAL_FEATURE_COLS_PATH, "wb") as f:
         pickle.dump(final_feature_columns, f)
 
-    print("========== TRAINING FINAL MODEL ==========")
+    print(" TRAINING FINAL MODEL ")
     final_model, final_best_epoch, final_best_test_loss = train_model_with_resume(
         X_train,
         y_train,
@@ -1110,11 +1110,11 @@ if __name__ == "__main__":
     report = classification_report(y_test.astype(int), test_preds, digits=4)
     roc_auc = roc_auc_score(y_test.astype(int), test_probs)
 
-    print("========== FINAL TEST RESULTS ==========")
-    print("========== CONFUSION MATRIX ==========")
+    print(" FINAL TEST RESULTS ")
+    print("CONFUSION MATRIX")
     print(cm)
     print()
-    print("========== CLASSIFICATION REPORT ==========")
+    print(" CLASSIFICATION REPORT ")
     print(report)
     print(f"ROC-AUC: {roc_auc:.4f}")
 
@@ -1136,7 +1136,7 @@ if __name__ == "__main__":
     final_scores_df.to_csv(FINAL_SCORES_PATH, index=False)
 
     print()
-    print("========== SAVED ARTIFACTS ==========")
+    print(" SAVED ARTIFACTS ")
     print("Base checkpoint      :", BASE_CHECKPOINT_PATH)
     print("Base best model      :", BASE_BEST_MODEL_PATH)
     print("Base scaler          :", BASE_SCALER_PATH)
