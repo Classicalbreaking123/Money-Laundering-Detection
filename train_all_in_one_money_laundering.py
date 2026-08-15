@@ -16,6 +16,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
 
 
+try:
+    import shap
+except ImportError:
+    shap = None
 
 
 SEED = 42
@@ -55,6 +59,8 @@ BASE_FEATURE_COLS_PATH = ARTIFACT_DIR / "base_feature_columns.pkl"
 FINAL_FEATURES_OUTPUT_PATH = ARTIFACT_DIR / "all_features_with_custom.csv"
 FINAL_SCORES_PATH = ARTIFACT_DIR / "final_all_risk_scores.csv"
 BASE_RISK_OUTPUT_PATH = ARTIFACT_DIR / "base_risk_scores.csv"
+SHAP_IMPORTANCE_PATH = ARTIFACT_DIR / "shap_feature_importance.csv"
+SHAP_VALUES_PATH = ARTIFACT_DIR / "shap_test_values.csv"
 
 
 @dataclass
@@ -606,6 +612,7 @@ def compute_graph_features(raw_data, partition=None):
         row = {
             "txId": node,
             "timestep": raw_data.timesteps[node],
+            "community_id": partition[node],
             "label": raw_data.labels[node],
             "label_binary": normalize_label_to_binary(raw_data.labels[node]),
             "indegree": in_deg,
@@ -878,52 +885,100 @@ def minmax_scale_dict(values_dict, eps=1e-12):
     return scaled
 
 
-def compute_hits_for_community(
-    community_nodes,
-    raw_data,
+def build_weighted_community_graph(raw_data, partition):
+    """Collapse the transaction graph into a weighted community graph.
+
+    Each directed edge between two different communities contributes one unit
+    of weight. The resulting weight therefore represents transaction-flow
+    volume between the two communities.
+    """
+    community_graph = nx.DiGraph()
+    community_ids = sorted(set(partition.values()))
+
+    for cid in community_ids:
+        community_graph.add_node(cid)
+
+    for src in raw_data.node_ids:
+        src_cid = partition[src]
+
+        for dst in raw_data.out_neighbors[src]:
+            dst_cid = partition[dst]
+
+            if src_cid == dst_cid:
+                continue
+
+            if community_graph.has_edge(src_cid, dst_cid):
+                community_graph[src_cid][dst_cid]["weight"] += 1.0
+            else:
+                community_graph.add_edge(
+                    src_cid,
+                    dst_cid,
+                    weight=1.0,
+                )
+
+    return community_graph
+
+
+def compute_weighted_hits_on_communities(
+    community_graph,
     max_iter=50,
     tol=1e-8,
 ):
-    """Standard HITS computed independently of any ML risk score."""
-    node_set = set(community_nodes)
+    """Run weighted HITS directly on the community-level flow graph."""
+    community_ids = list(community_graph.nodes())
 
-    in_neighbors_comm = {
-        node: [nbr for nbr in raw_data.in_neighbors[node] if nbr in node_set]
-        for node in community_nodes
-    }
-    out_neighbors_comm = {
-        node: [nbr for nbr in raw_data.out_neighbors[node] if nbr in node_set]
-        for node in community_nodes
-    }
+    if len(community_ids) == 0:
+        return {}, {}
 
-    hub = {node: 1.0 for node in community_nodes}
-    authority = {node: 1.0 for node in community_nodes}
+    hub = {cid: 1.0 for cid in community_ids}
+    authority = {cid: 1.0 for cid in community_ids}
 
     for _ in range(max_iter):
         new_authority = {}
-        for node in community_nodes:
-            new_authority[node] = sum(hub[nbr] for nbr in in_neighbors_comm[node])
 
-        auth_norm = math.sqrt(sum(v * v for v in new_authority.values()))
+        for cid in community_ids:
+            value = 0.0
+
+            for src, _, data in community_graph.in_edges(
+                cid, data=True
+            ):
+                value += data.get("weight", 1.0) * hub[src]
+
+            new_authority[cid] = value
+
+        auth_norm = math.sqrt(
+            sum(value * value for value in new_authority.values())
+        )
+
         if auth_norm > 0:
-            for node in community_nodes:
-                new_authority[node] /= auth_norm
+            for cid in community_ids:
+                new_authority[cid] /= auth_norm
 
         new_hub = {}
-        for node in community_nodes:
-            new_hub[node] = sum(
-                new_authority[nbr] for nbr in out_neighbors_comm[node]
-            )
 
-        hub_norm = math.sqrt(sum(v * v for v in new_hub.values()))
+        for cid in community_ids:
+            value = 0.0
+
+            for _, dst, data in community_graph.out_edges(
+                cid, data=True
+            ):
+                value += data.get("weight", 1.0) * new_authority[dst]
+
+            new_hub[cid] = value
+
+        hub_norm = math.sqrt(
+            sum(value * value for value in new_hub.values())
+        )
+
         if hub_norm > 0:
-            for node in community_nodes:
-                new_hub[node] /= hub_norm
+            for cid in community_ids:
+                new_hub[cid] /= hub_norm
 
         diff = 0.0
-        for node in community_nodes:
-            diff += abs(new_authority[node] - authority[node])
-            diff += abs(new_hub[node] - hub[node])
+
+        for cid in community_ids:
+            diff += abs(new_authority[cid] - authority[cid])
+            diff += abs(new_hub[cid] - hub[cid])
 
         authority = new_authority
         hub = new_hub
@@ -934,171 +989,155 @@ def compute_hits_for_community(
     return hub, authority
 
 
-def compute_community_hits_features(
+def compute_community_features(
     partition,
     raw_data,
+    base_risk_map,
     max_iter=50,
     tol=1e-8,
 ):
-    """Create community size, hub, authority and combined HITS features."""
+    """Create community risk context and weighted community-HITS features.
+
+    For every community we calculate:
+        - community size
+        - average base risk
+        - maximum base risk
+        - minimum base risk
+        - weighted HITS hub score
+        - weighted HITS authority score
+        - combined community HITS score
+
+    The resulting community-level values are attached to every node in that
+    community.
+    """
     comm_to_nodes = get_community_nodes(partition)
 
-    community_size_by_cid = {}
+    community_graph = build_weighted_community_graph(
+        raw_data,
+        partition,
+    )
+
+    hub_by_cid, authority_by_cid = compute_weighted_hits_on_communities(
+        community_graph,
+        max_iter=max_iter,
+        tol=tol,
+    )
+
+                                                                      
+    normalized_hub = minmax_scale_dict(hub_by_cid)
+    normalized_authority = minmax_scale_dict(authority_by_cid)
+
+    combined_hits_by_cid = {}
+
+    for cid in comm_to_nodes:
+        hub_value = normalized_hub.get(cid, 0.0)
+        authority_value = normalized_authority.get(cid, 0.0)
+
+        combined_hits_by_cid[cid] = (
+            0.5 * hub_value +
+            0.5 * authority_value
+        )
+
+    community_size = {}
+    community_avg_risk = {}
+    community_max_risk = {}
+    community_min_risk = {}
     community_hub_score = {}
     community_authority_score = {}
     community_hits_score = {}
 
     for cid, nodes in comm_to_nodes.items():
-        community_size_by_cid[cid] = len(nodes)
-
-        if len(nodes) == 1:
-            node = nodes[0]
-            community_hub_score[node] = 0.0
-            community_authority_score[node] = 0.0
-            community_hits_score[node] = 0.0
-            continue
-
-        hub_dict, auth_dict = compute_hits_for_community(
-            nodes, raw_data, max_iter=max_iter, tol=tol
-        )
-
-        combined = {
-            node: 0.5 * (hub_dict[node] + auth_dict[node])
+        risks = [
+            float(base_risk_map.get(node, 0.0))
             for node in nodes
-        }
-        normalized = minmax_scale_dict(combined)
+        ]
 
-        for node in nodes:
-            community_hub_score[node] = hub_dict[node]
-            community_authority_score[node] = auth_dict[node]
-            community_hits_score[node] = normalized[node]
+        community_size[cid] = len(nodes)
+        community_avg_risk[cid] = (
+            float(np.mean(risks)) if risks else 0.0
+        )
+        community_max_risk[cid] = (
+            float(max(risks)) if risks else 0.0
+        )
+        community_min_risk[cid] = (
+            float(min(risks)) if risks else 0.0
+        )
+        community_hub_score[cid] = hub_by_cid.get(cid, 0.0)
+        community_authority_score[cid] = authority_by_cid.get(cid, 0.0)
+        community_hits_score[cid] = combined_hits_by_cid.get(cid, 0.0)
 
     return (
-        community_size_by_cid,
+        community_size,
+        community_avg_risk,
+        community_max_risk,
+        community_min_risk,
         community_hub_score,
         community_authority_score,
         community_hits_score,
     )
 
 
-def compute_risk_aware_hits_for_community(
-    community_nodes,
-    raw_data,
-    base_risk_map,
-    max_iter=50,
-    tol=1e-8,
-):
-   
-    node_set = set(community_nodes)
+def compute_shap_feature_importance(model, X_background, X_explain, feature_names):
+    """
+    Compute SHAP explanations for the PyTorch final model.
 
-    in_neighbors_comm = {
-        node: [nbr for nbr in raw_data.in_neighbors[node] if nbr in node_set]
-        for node in community_nodes
-    }
-    out_neighbors_comm = {
-        node: [nbr for nbr in raw_data.out_neighbors[node] if nbr in node_set]
-        for node in community_nodes
-    }
-
-    hub = {node: 1.0 for node in community_nodes}
-    authority = {node: 1.0 for node in community_nodes}
-
-    for _ in range(max_iter):
-        new_authority = {}
-        for node in community_nodes:
-            value = 0.0
-            for nbr in in_neighbors_comm[node]:
-                value += base_risk_map[nbr] * hub[nbr]
-            new_authority[node] = value
-
-        auth_norm = math.sqrt(sum(v * v for v in new_authority.values()))
-        if auth_norm > 0:
-            for node in community_nodes:
-                new_authority[node] /= auth_norm
-
-        new_hub = {}
-        for node in community_nodes:
-            value = 0.0
-            for nbr in out_neighbors_comm[node]:
-                value += base_risk_map[nbr] * new_authority[nbr]
-            new_hub[node] = value
-
-        hub_norm = math.sqrt(sum(v * v for v in new_hub.values()))
-        if hub_norm > 0:
-            for node in community_nodes:
-                new_hub[node] /= hub_norm
-
-        diff = 0.0
-        for node in community_nodes:
-            diff += abs(new_authority[node] - authority[node])
-            diff += abs(new_hub[node] - hub[node])
-
-        authority = new_authority
-        hub = new_hub
-
-        if diff < tol:
-            break
-
-    return hub, authority
-
-
-def compute_community_hits_refinement(
-    partition,
-    raw_data,
-    base_risk_map,
-    lam=0.1,
-    max_iter=50,
-    tol=1e-8,
-):
-    comm_to_nodes = get_community_nodes(partition)
-
-    community_size_by_cid = {}
-    community_hub_score = {}
-    community_authority_score = {}
-    community_hits_score = {}
-    community_refined_risk = {}
-
-    for cid, nodes in comm_to_nodes.items():
-        community_size_by_cid[cid] = len(nodes)
-
-        if len(nodes) == 1:
-            node = nodes[0]
-            community_hub_score[node] = 0.0
-            community_authority_score[node] = 0.0
-            community_hits_score[node] = 0.0
-            community_refined_risk[node] = base_risk_map[node]
-            continue
-
-        hub_dict, auth_dict = compute_risk_aware_hits_for_community(
-            community_nodes=nodes,
-            raw_data=raw_data,
-            base_risk_map=base_risk_map,
-            max_iter=max_iter,
-            tol=tol,
+    SHAP explains how each feature pushes an individual prediction up or down.
+    Global importance is mean absolute SHAP value across explained transactions.
+    This explains model output, not accuracy directly.
+    """
+    if shap is None:
+        raise ImportError(
+            "The 'shap' package is not installed. Install it with: pip install shap"
         )
 
-        combined_score = {}
-        for node in nodes:
-            community_hub_score[node] = hub_dict[node]
-            community_authority_score[node] = auth_dict[node]
-            combined_score[node] = 0.5 * (hub_dict[node] + auth_dict[node])
+    model.eval()
 
-        normalized_combined = minmax_scale_dict(combined_score)
+    background = torch.tensor(X_background, dtype=torch.float32)
+    explain_tensor = torch.tensor(X_explain, dtype=torch.float32)
 
-        for node in nodes:
-            c_i = normalized_combined[node]
-            b_i = base_risk_map[node]
+    class ShapModelWrapper(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.base_model = base_model
 
-            community_hits_score[node] = c_i
-            community_refined_risk[node] = (b_i + lam * c_i) / (1.0 + lam)
+        def forward(self, x):
+            return self.base_model(x).unsqueeze(1)
 
-    return (
-        community_size_by_cid,
-        community_hub_score,
-        community_authority_score,
-        community_hits_score,
-        community_refined_risk,
-    )
+    shap_model = ShapModelWrapper(model)
+
+    explainer = shap.DeepExplainer(shap_model, background)
+    shap_values = explainer.shap_values(explain_tensor)
+
+    if isinstance(shap_values, list):
+        shap_values = shap_values[0]
+
+    shap_values = np.asarray(shap_values)
+
+    if shap_values.ndim == 3 and shap_values.shape[-1] == 1:
+        shap_values = shap_values[:, :, 0]
+    elif shap_values.ndim == 3 and shap_values.shape[0] == 1:
+        shap_values = shap_values[0]
+
+    if shap_values.ndim != 2:
+        raise ValueError(f"Unexpected SHAP output shape: {shap_values.shape}")
+
+    if shap_values.shape[1] != len(feature_names):
+        raise ValueError(
+            f"SHAP feature dimension {shap_values.shape[1]} does not match "
+            f"{len(feature_names)} feature names."
+        )
+
+    mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+
+    importance_df = pd.DataFrame({
+        "feature": feature_names,
+        "mean_abs_shap": mean_abs_shap,
+    }).sort_values(
+        "mean_abs_shap",
+        ascending=False
+    ).reset_index(drop=True)
+
+    return importance_df, shap_values
 
 
 if __name__ == "__main__":
@@ -1156,11 +1195,14 @@ if __name__ == "__main__":
 
     print("\nBUILDING LEAKAGE-SAFE BASE RISK SCORES")
 
-    HITS_FEATURE_NAMES = {
+    COMMUNITY_FEATURE_NAMES = {
+        "community_size",
+        "community_avg_risk",
+        "community_max_risk",
+        "community_min_risk",
         "community_hub_score",
         "community_authority_score",
         "community_hits_score",
-        "community_refined_risk",
         "base_risk_score",
     }
 
@@ -1172,7 +1214,7 @@ if __name__ == "__main__":
             "label_binary",
             "target",
             "community_id",
-        } and col not in HITS_FEATURE_NAMES
+        } and col not in COMMUNITY_FEATURE_NAMES
     ]
 
     with open(BASE_FEATURE_COLS_PATH, "wb") as f:
@@ -1241,7 +1283,7 @@ if __name__ == "__main__":
 
     print(
         f"Generating {OOF_FOLDS}-fold out-of-fold base risks "
-        "and risk-aware HITS in one pass..."
+        "for leakage-safe community features..."
     )
 
     train_fold_by_txid = {}
@@ -1294,110 +1336,154 @@ if __name__ == "__main__":
 
     full_base_score_map = dict(zip(all_node_ids, full_base_scores))
 
-    training_hits_risk_map = dict(full_base_score_map)
-    training_hits_risk_map.update(fully_oof_risk_map)
+                                                                           
+                                                                               
+    training_base_risk_map = dict(full_base_score_map)
+    training_base_risk_map.update(fully_oof_risk_map)
 
-    def compute_risk_hits_for_risk_map(base_risk_map):
-        (
-            community_size_by_cid,
-            community_hub_score,
-            community_authority_score,
-            community_hits_score,
-            community_refined_risk,
-        ) = compute_community_hits_refinement(
+    def compute_community_features_for_risk_map(base_risk_map):
+        return compute_community_features(
             partition=partition,
             raw_data=raw_data,
             base_risk_map=base_risk_map,
-            lam=LAMBDA_COMMUNITY,
             max_iter=COMMUNITY_HITS_MAX_ITER,
             tol=COMMUNITY_HITS_TOL,
         )
 
-        return (
-            community_size_by_cid,
-            community_hub_score,
-            community_authority_score,
-            community_hits_score,
-            community_refined_risk,
-        )
-
     (
         train_comm_size,
+        train_comm_avg_risk,
+        train_comm_max_risk,
+        train_comm_min_risk,
         train_hub,
         train_auth,
         train_hits,
-        train_refined,
-    ) = compute_risk_hits_for_risk_map(training_hits_risk_map)
+    ) = compute_community_features_for_risk_map(
+        training_base_risk_map
+    )
 
     train_risk_hits = {}
 
     for txid in train_df["txId"].astype(int):
         txid = int(txid)
+        cid = partition[txid]
+
         train_risk_hits[txid] = {
             "base_risk_score": fully_oof_risk_map[txid],
-            "community_hub_score": train_hub[txid],
-            "community_authority_score": train_auth[txid],
-            "community_hits_score": train_hits[txid],
-            "community_refined_risk": train_refined[txid],
-            "community_size": train_comm_size[partition[txid]],
+            "community_size": train_comm_size[cid],
+            "community_avg_risk": train_comm_avg_risk[cid],
+            "community_max_risk": train_comm_max_risk[cid],
+            "community_min_risk": train_comm_min_risk[cid],
+            "community_hub_score": train_hub[cid],
+            "community_authority_score": train_auth[cid],
+            "community_hits_score": train_hits[cid],
         }
 
     if len(train_risk_hits) != len(train_df):
         raise RuntimeError(
-            "OOF HITS generation failed: not every training node received "
-            "exactly one leakage-safe HITS feature set."
+            "OOF community feature generation failed: not every training "
+            "node received exactly one leakage-safe feature set."
         )
 
     (
         validation_comm_size,
+        validation_comm_avg_risk,
+        validation_comm_max_risk,
+        validation_comm_min_risk,
         validation_hub,
         validation_auth,
         validation_hits,
-        validation_refined,
-    ) = compute_risk_hits_for_risk_map(full_base_score_map)
+    ) = compute_community_features_for_risk_map(
+        full_base_score_map
+    )
 
     validation_risk_hits = {}
 
     for txid in validation_df["txId"].astype(int):
         txid = int(txid)
+        cid = partition[txid]
+
         validation_risk_hits[txid] = {
             "base_risk_score": full_base_score_map[txid],
-            "community_hub_score": validation_hub[txid],
-            "community_authority_score": validation_auth[txid],
-            "community_hits_score": validation_hits[txid],
-            "community_refined_risk": validation_refined[txid],
-            "community_size": validation_comm_size[partition[txid]],
+            "community_size": validation_comm_size[cid],
+            "community_avg_risk": validation_comm_avg_risk[cid],
+            "community_max_risk": validation_comm_max_risk[cid],
+            "community_min_risk": validation_comm_min_risk[cid],
+            "community_hub_score": validation_hub[cid],
+            "community_authority_score": validation_auth[cid],
+            "community_hits_score": validation_hits[cid],
         }
 
     (
         test_comm_size,
+        test_comm_avg_risk,
+        test_comm_max_risk,
+        test_comm_min_risk,
         test_hub,
         test_auth,
         test_hits,
-        test_refined,
-    ) = compute_risk_hits_for_risk_map(full_base_score_map)
+    ) = compute_community_features_for_risk_map(
+        full_base_score_map
+    )
 
     test_risk_hits = {}
 
     for txid in test_df["txId"].astype(int):
         txid = int(txid)
+        cid = partition[txid]
+
         test_risk_hits[txid] = {
             "base_risk_score": full_base_score_map[txid],
-            "community_hub_score": test_hub[txid],
-            "community_authority_score": test_auth[txid],
-            "community_hits_score": test_hits[txid],
-            "community_refined_risk": test_refined[txid],
-            "community_size": test_comm_size[partition[txid]],
+            "community_size": test_comm_size[cid],
+            "community_avg_risk": test_comm_avg_risk[cid],
+            "community_max_risk": test_comm_max_risk[cid],
+            "community_min_risk": test_comm_min_risk[cid],
+            "community_hub_score": test_hub[cid],
+            "community_authority_score": test_auth[cid],
+            "community_hits_score": test_hits[cid],
         }
 
-    for feature_name in [
+    (
+        all_comm_size,
+        all_comm_avg_risk,
+        all_comm_max_risk,
+        all_comm_min_risk,
+        all_hub,
+        all_auth,
+        all_hits,
+    ) = compute_community_features_for_risk_map(
+        full_base_score_map
+    )
+
+    all_community_features = {}
+
+    for txid in all_node_ids:
+        cid = partition[txid]
+        all_community_features[txid] = {
+            "base_risk_score": full_base_score_map.get(txid, 0.0),
+            "community_size": all_comm_size[cid],
+            "community_avg_risk": all_comm_avg_risk[cid],
+            "community_max_risk": all_comm_max_risk[cid],
+            "community_min_risk": all_comm_min_risk[cid],
+            "community_hub_score": all_hub[cid],
+            "community_authority_score": all_auth[cid],
+            "community_hits_score": all_hits[cid],
+        }
+
+    community_feature_names = [
         "base_risk_score",
+        "community_size",
+        "community_avg_risk",
+        "community_max_risk",
+        "community_min_risk",
         "community_hub_score",
         "community_authority_score",
         "community_hits_score",
-        "community_refined_risk",
-    ]:
+    ]
+
+    for feature_name in community_feature_names:
         values = []
+
         for txid in features_df["txId"].astype(int):
             if txid in train_risk_hits:
                 values.append(train_risk_hits[txid][feature_name])
@@ -1406,16 +1492,19 @@ if __name__ == "__main__":
             elif txid in test_risk_hits:
                 values.append(test_risk_hits[txid][feature_name])
             else:
-                values.append(full_base_score_map.get(txid, 0.0))
+                values.append(all_community_features[txid][feature_name])
 
         features_df[feature_name] = values
 
-    print("\nRISK-AWARE HITS FEATURES ADDED")
+    print("\nCOMMUNITY RISK + WEIGHTED HITS FEATURES ADDED")
     print("base_risk_score")
+    print("community_size")
+    print("community_avg_risk")
+    print("community_max_risk")
+    print("community_min_risk")
     print("community_hub_score")
     print("community_authority_score")
     print("community_hits_score")
-    print("community_refined_risk")
 
 
     risk_by_txid = dict(
@@ -1569,6 +1658,42 @@ if __name__ == "__main__":
     print("\nCLASSIFICATION REPORT")
     print(report)
     print(f"ROC-AUC: {roc_auc:.4f}")
+
+    print("\nCOMPUTING SHAP FEATURE IMPORTANCE")
+
+    SHAP_BACKGROUND_SIZE = min(50, len(X_train))
+    SHAP_EXPLAIN_SIZE = min(100, len(X_test))
+
+    shap_background = X_train[:SHAP_BACKGROUND_SIZE]
+
+    if len(X_test) > SHAP_EXPLAIN_SIZE:
+        shap_indices = np.linspace(
+            0, len(X_test) - 1, SHAP_EXPLAIN_SIZE, dtype=int
+        )
+        shap_explain = X_test[shap_indices]
+        shap_txids = test_df.iloc[shap_indices]["txId"].astype(int).values
+    else:
+        shap_explain = X_test
+        shap_txids = test_df["txId"].astype(int).values
+
+    shap_importance_df, shap_values = compute_shap_feature_importance(
+        model=final_model,
+        X_background=shap_background,
+        X_explain=shap_explain,
+        feature_names=feature_columns,
+    )
+
+    shap_importance_df.to_csv(SHAP_IMPORTANCE_PATH, index=False)
+
+    shap_values_df = pd.DataFrame(
+        shap_values,
+        columns=feature_columns,
+    )
+    shap_values_df.insert(0, "txId", shap_txids)
+    shap_values_df.to_csv(SHAP_VALUES_PATH, index=False)
+
+    print("\nTOP SHAP FEATURES")
+    print(shap_importance_df.head(15).to_string(index=False))
 
     features_df.to_csv(FINAL_FEATURES_OUTPUT_PATH, index=False)
 
