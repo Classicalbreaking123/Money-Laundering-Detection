@@ -11,23 +11,32 @@ import pandas as pd
 import networkx as nx
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
 
 
+try:
+    import shap
+except ImportError:
+    shap = None
+
+
 SEED = 42
 TEST_SIZE = 0.30
+VALIDATION_SIZE = 0.15
 
 COMMUNITY_GAMMA = 1.0
 COMMUNITY_MAX_PASSES = 15
-LAMBDA_COMMUNITY = 0.1
+LAMBDA_COMMUNITY = 0.2
 
 COMMUNITY_HITS_MAX_ITER = 50
 COMMUNITY_HITS_TOL = 1e-8
 
-BASE_EPOCHS = 300
-FINAL_EPOCHS = 450
+
+EPOCHS = 600
+BASE_OOF_EPOCHS = 300
+OOF_FOLDS = 5
 LR = 1e-3
 
 DFER_BETA = 0.8
@@ -43,18 +52,15 @@ CLASSES_PATH = "data/elliptic_txs_classes.csv"
 EDGELIST_PATH = "data/elliptic_txs_edgelist.csv"
 FEATURES_PATH = "data/elliptic_txs_features.csv"
 
-BASE_CHECKPOINT_PATH = ARTIFACT_DIR / "base_checkpoint.pt"
-BASE_BEST_MODEL_PATH = ARTIFACT_DIR / "base_best_model.pt"
-BASE_SCALER_PATH = ARTIFACT_DIR / "base_scaler.pkl"
-BASE_FEATURE_COLS_PATH = ARTIFACT_DIR / "base_feature_columns.pkl"
-
-FINAL_CHECKPOINT_PATH = ARTIFACT_DIR / "final_checkpoint.pt"
-FINAL_BEST_MODEL_PATH = ARTIFACT_DIR / "final_best_model.pt"
 FINAL_SCALER_PATH = ARTIFACT_DIR / "final_all_feature_scaler.pkl"
 FINAL_FEATURE_COLS_PATH = ARTIFACT_DIR / "final_feature_columns.pkl"
+BASE_FEATURE_COLS_PATH = ARTIFACT_DIR / "base_feature_columns.pkl"
 
 FINAL_FEATURES_OUTPUT_PATH = ARTIFACT_DIR / "all_features_with_custom.csv"
 FINAL_SCORES_PATH = ARTIFACT_DIR / "final_all_risk_scores.csv"
+BASE_RISK_OUTPUT_PATH = ARTIFACT_DIR / "base_risk_scores.csv"
+SHAP_IMPORTANCE_PATH = ARTIFACT_DIR / "shap_feature_importance.csv"
+SHAP_VALUES_PATH = ARTIFACT_DIR / "shap_test_values.csv"
 
 
 @dataclass
@@ -390,10 +396,132 @@ def compute_discounted_flow_entropy_rate(
     return flow_uncertainty
 
 
-def compute_graph_features(raw_data):
+
+def compute_additional_flow_features(raw_data, node_ids, partition):
+    """Compute additional fan-in, fan-out, relay, neighbor-structure,
+    neighbor-core, neighbor-clustering and community flow features."""
+    fan_in_score = {}
+    fan_out_score = {}
+    relay_score = {}
+    in_neighbor_mean_degree = {}
+    out_neighbor_mean_degree = {}
+    in_neighbor_max_degree = {}
+    out_neighbor_max_degree = {}
+    in_neighbor_mean_core = {}
+    out_neighbor_mean_core = {}
+    in_neighbor_max_core = {}
+    out_neighbor_max_core = {}
+    in_neighbor_mean_clustering = {}
+    out_neighbor_mean_clustering = {}
+    community_internal_ratio = {}
+    community_external_ratio = {}
+
+    G = raw_data.graph
+    G_und = G.to_undirected()
+    und_degree = dict(G_und.degree())
+    neighbor_core = compute_core_numbers_manual(G_und)
+    neighbor_clustering = nx.clustering(G_und)
+
+    for node in node_ids:
+        in_neighbors = set(raw_data.in_neighbors[node])
+        out_neighbors = set(raw_data.out_neighbors[node])
+
+        in_deg = len(in_neighbors)
+        out_deg = len(out_neighbors)
+
+        fan_in_score[node] = in_deg / (in_deg + out_deg + 1e-9)
+        fan_out_score[node] = out_deg / (in_deg + out_deg + 1e-9)
+
+        relay_score[node] = (
+            min(in_deg, out_deg) / (max(in_deg, out_deg) + 1e-9)
+        )
+
+        in_degrees = [und_degree.get(nbr, 0) for nbr in in_neighbors]
+        out_degrees = [und_degree.get(nbr, 0) for nbr in out_neighbors]
+
+        in_neighbor_mean_degree[node] = (
+            float(np.mean(in_degrees)) if in_degrees else 0.0
+        )
+        out_neighbor_mean_degree[node] = (
+            float(np.mean(out_degrees)) if out_degrees else 0.0
+        )
+        in_neighbor_max_degree[node] = (
+            float(max(in_degrees)) if in_degrees else 0.0
+        )
+        out_neighbor_max_degree[node] = (
+            float(max(out_degrees)) if out_degrees else 0.0
+        )
+
+        in_cores = [neighbor_core.get(nbr, 0) for nbr in in_neighbors]
+        out_cores = [neighbor_core.get(nbr, 0) for nbr in out_neighbors]
+        in_cluster = [neighbor_clustering.get(nbr, 0.0) for nbr in in_neighbors]
+        out_cluster = [neighbor_clustering.get(nbr, 0.0) for nbr in out_neighbors]
+
+        in_neighbor_mean_core[node] = (
+            float(np.mean(in_cores)) if in_cores else 0.0
+        )
+        out_neighbor_mean_core[node] = (
+            float(np.mean(out_cores)) if out_cores else 0.0
+        )
+        in_neighbor_max_core[node] = (
+            float(max(in_cores)) if in_cores else 0.0
+        )
+        out_neighbor_max_core[node] = (
+            float(max(out_cores)) if out_cores else 0.0
+        )
+        in_neighbor_mean_clustering[node] = (
+            float(np.mean(in_cluster)) if in_cluster else 0.0
+        )
+        out_neighbor_mean_clustering[node] = (
+            float(np.mean(out_cluster)) if out_cluster else 0.0
+        )
+
+        cid = partition[node]
+        total = in_deg + out_deg
+        internal = 0
+
+        for nbr in in_neighbors:
+            if partition.get(nbr) == cid:
+                internal += 1
+
+        for nbr in out_neighbors:
+            if partition.get(nbr) == cid:
+                internal += 1
+
+        community_internal_ratio[node] = internal / (total + 1e-9)
+        community_external_ratio[node] = 1.0 - community_internal_ratio[node]
+
+    return (
+        fan_in_score,
+        fan_out_score,
+        relay_score,
+        in_neighbor_mean_degree,
+        out_neighbor_mean_degree,
+        in_neighbor_max_degree,
+        out_neighbor_max_degree,
+        in_neighbor_mean_core,
+        out_neighbor_mean_core,
+        in_neighbor_max_core,
+        out_neighbor_max_core,
+        in_neighbor_mean_clustering,
+        out_neighbor_mean_clustering,
+        community_internal_ratio,
+        community_external_ratio,
+    )
+
+
+def compute_graph_features(raw_data, partition=None):
     G = raw_data.graph
     node_ids = raw_data.node_ids
     timesteps = raw_data.timesteps
+
+    if partition is None:
+        adjacency_for_partition = build_undirected_adjacency(raw_data)
+        partition = run_louvain_local_communities(
+            adjacency=adjacency_for_partition,
+            max_passes=COMMUNITY_MAX_PASSES,
+            gamma=COMMUNITY_GAMMA,
+        )
 
     indegree = dict(G.in_degree())
     outdegree = dict(G.out_degree())
@@ -447,6 +575,26 @@ def compute_graph_features(raw_data):
         tol=DFER_TOL,
     )
 
+    (
+        fan_in_score,
+        fan_out_score,
+        relay_score,
+        in_neighbor_mean_degree,
+        out_neighbor_mean_degree,
+        in_neighbor_max_degree,
+        out_neighbor_max_degree,
+        in_neighbor_mean_core,
+        out_neighbor_mean_core,
+        in_neighbor_max_core,
+        out_neighbor_max_core,
+        in_neighbor_mean_clustering,
+        out_neighbor_mean_clustering,
+        community_internal_ratio,
+        community_external_ratio,
+    ) = compute_additional_flow_features(
+        raw_data, node_ids, partition
+    )
+
     rows = []
 
     for node in node_ids:
@@ -482,6 +630,21 @@ def compute_graph_features(raw_data):
             "bridge_cross_density": bridge_cross_density.get(node, 1.0),
             "bridge_score": bridge_score.get(node, 0.0),
             "flow_uncertainty_score": flow_uncertainty_map[node],
+            "fan_in_score": fan_in_score[node],
+            "fan_out_score": fan_out_score[node],
+            "relay_score": relay_score[node],
+            "in_neighbor_mean_degree": in_neighbor_mean_degree[node],
+            "out_neighbor_mean_degree": out_neighbor_mean_degree[node],
+            "in_neighbor_max_degree": in_neighbor_max_degree[node],
+            "out_neighbor_max_degree": out_neighbor_max_degree[node],
+            "in_neighbor_mean_core": in_neighbor_mean_core[node],
+            "out_neighbor_mean_core": out_neighbor_mean_core[node],
+            "in_neighbor_max_core": in_neighbor_max_core[node],
+            "out_neighbor_max_core": out_neighbor_max_core[node],
+            "in_neighbor_mean_clustering": in_neighbor_mean_clustering[node],
+            "out_neighbor_mean_clustering": out_neighbor_mean_clustering[node],
+            "community_internal_ratio": community_internal_ratio[node],
+            "community_external_ratio": community_external_ratio[node],
         }
         rows.append(row)
 
@@ -507,26 +670,27 @@ class RiskMLP(nn.Module):
         return self.net(x).squeeze(1)
 
 
-def train_model_with_resume(
+def train_model(
     X_train,
     y_train,
-    X_test,
-    y_test,
-    checkpoint_path,
-    best_model_path,
+    X_validation,
+    y_validation,
     epochs=60,
     lr=1e-3,
     hidden_dims=(128, 64),
     dropout=0.2,
-    model_name="model",
 ):
     X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
     y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
 
-    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
-    y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+    X_validation_tensor = torch.tensor(X_validation, dtype=torch.float32)
+    y_validation_tensor = torch.tensor(y_validation, dtype=torch.float32)
 
-    model = RiskMLP(input_dim=X_train.shape[1], hidden_dims=hidden_dims, dropout=dropout)
+    model = RiskMLP(
+        input_dim=X_train.shape[1],
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+    )
 
     num_pos = float(y_train.sum())
     num_neg = float(len(y_train) - y_train.sum())
@@ -536,27 +700,11 @@ def train_model_with_resume(
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    start_epoch = 0
-    best_test_loss = float("inf")
+    best_validation_loss = float("inf")
     best_epoch = -1
+    best_model_state = None
 
-    if checkpoint_path.exists():
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = int(checkpoint["epoch"])
-        best_test_loss = float(checkpoint["best_test_loss"])
-        best_epoch = int(checkpoint["best_epoch"])
-
-        print(
-            f"Resuming {model_name} from checkpoint: "
-            f"epoch {start_epoch}/{epochs} | "
-            f"best_test_loss={best_test_loss:.4f} | best_epoch={best_epoch}"
-        )
-    else:
-        print(f"No existing {model_name} checkpoint found. Starting from scratch.")
-
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
 
@@ -567,39 +715,32 @@ def train_model_with_resume(
 
         model.eval()
         with torch.no_grad():
-            test_logits = model(X_test_tensor)
-            test_loss = criterion(test_logits, y_test_tensor)
+            validation_logits = model(X_validation_tensor)
+            validation_loss = criterion(
+                validation_logits,
+                y_validation_tensor,
+            )
 
-        test_loss_value = test_loss.item()
+        validation_loss_value = validation_loss.item()
 
-        if test_loss_value < best_test_loss:
-            best_test_loss = test_loss_value
+        if validation_loss_value < best_validation_loss:
+            best_validation_loss = validation_loss_value
             best_epoch = epoch + 1
-            torch.save(model.state_dict(), best_model_path)
-
-        checkpoint = {
-            "epoch": epoch + 1,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_test_loss": best_test_loss,
-            "best_epoch": best_epoch,
-            "hidden_dims": hidden_dims,
-            "dropout": dropout,
-            "input_dim": X_train.shape[1],
-        }
-        torch.save(checkpoint, checkpoint_path)
+            best_model_state = {
+                key: value.detach().clone()
+                for key, value in model.state_dict().items()
+            }
 
         print(
             f"Epoch {epoch+1:03d}/{epochs} | "
             f"Train Loss: {train_loss.item():.4f} | "
-            f"Test Loss: {test_loss_value:.4f}"
+            f"Validation Loss: {validation_loss_value:.4f}"
         )
 
-    if best_model_path.exists():
-        model.load_state_dict(torch.load(best_model_path, map_location="cpu"))
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
-    return model, best_epoch, best_test_loss
-
+    return model, best_epoch, best_validation_loss
 
 def build_undirected_adjacency(raw_data):
     adjacency = {}
@@ -743,6 +884,109 @@ def minmax_scale_dict(values_dict, eps=1e-12):
     return scaled
 
 
+def compute_hits_for_community(
+    community_nodes,
+    raw_data,
+    max_iter=50,
+    tol=1e-8,
+):
+    """Standard HITS computed independently of any ML risk score."""
+    node_set = set(community_nodes)
+
+    in_neighbors_comm = {
+        node: [nbr for nbr in raw_data.in_neighbors[node] if nbr in node_set]
+        for node in community_nodes
+    }
+    out_neighbors_comm = {
+        node: [nbr for nbr in raw_data.out_neighbors[node] if nbr in node_set]
+        for node in community_nodes
+    }
+
+    hub = {node: 1.0 for node in community_nodes}
+    authority = {node: 1.0 for node in community_nodes}
+
+    for _ in range(max_iter):
+        new_authority = {}
+        for node in community_nodes:
+            new_authority[node] = sum(hub[nbr] for nbr in in_neighbors_comm[node])
+
+        auth_norm = math.sqrt(sum(v * v for v in new_authority.values()))
+        if auth_norm > 0:
+            for node in community_nodes:
+                new_authority[node] /= auth_norm
+
+        new_hub = {}
+        for node in community_nodes:
+            new_hub[node] = sum(
+                new_authority[nbr] for nbr in out_neighbors_comm[node]
+            )
+
+        hub_norm = math.sqrt(sum(v * v for v in new_hub.values()))
+        if hub_norm > 0:
+            for node in community_nodes:
+                new_hub[node] /= hub_norm
+
+        diff = 0.0
+        for node in community_nodes:
+            diff += abs(new_authority[node] - authority[node])
+            diff += abs(new_hub[node] - hub[node])
+
+        authority = new_authority
+        hub = new_hub
+
+        if diff < tol:
+            break
+
+    return hub, authority
+
+
+def compute_community_hits_features(
+    partition,
+    raw_data,
+    max_iter=50,
+    tol=1e-8,
+):
+    """Create community size, hub, authority and combined HITS features."""
+    comm_to_nodes = get_community_nodes(partition)
+
+    community_size_by_cid = {}
+    community_hub_score = {}
+    community_authority_score = {}
+    community_hits_score = {}
+
+    for cid, nodes in comm_to_nodes.items():
+        community_size_by_cid[cid] = len(nodes)
+
+        if len(nodes) == 1:
+            node = nodes[0]
+            community_hub_score[node] = 0.0
+            community_authority_score[node] = 0.0
+            community_hits_score[node] = 0.0
+            continue
+
+        hub_dict, auth_dict = compute_hits_for_community(
+            nodes, raw_data, max_iter=max_iter, tol=tol
+        )
+
+        combined = {
+            node: 0.5 * (hub_dict[node] + auth_dict[node])
+            for node in nodes
+        }
+        normalized = minmax_scale_dict(combined)
+
+        for node in nodes:
+            community_hub_score[node] = hub_dict[node]
+            community_authority_score[node] = auth_dict[node]
+            community_hits_score[node] = normalized[node]
+
+    return (
+        community_size_by_cid,
+        community_hub_score,
+        community_authority_score,
+        community_hits_score,
+    )
+
+
 def compute_risk_aware_hits_for_community(
     community_nodes,
     raw_data,
@@ -750,57 +994,61 @@ def compute_risk_aware_hits_for_community(
     max_iter=50,
     tol=1e-8,
 ):
+    """
+    Risk-aware HITS.
+
+    Authority receives weighted contributions from incoming hubs:
+        A_i = sum_j [ risk(j) * H_j ]
+
+    Hub receives weighted contributions from outgoing authorities:
+        H_i = sum_j [ risk(j) * A_j ]
+
+    The base-risk map is supplied externally. Leakage-safe construction of
+    that map is handled by the OOF pipeline in main().
+    """
     node_set = set(community_nodes)
 
-    in_neighbors_comm = {}
-    out_neighbors_comm = {}
+    in_neighbors_comm = {
+        node: [nbr for nbr in raw_data.in_neighbors[node] if nbr in node_set]
+        for node in community_nodes
+    }
+    out_neighbors_comm = {
+        node: [nbr for nbr in raw_data.out_neighbors[node] if nbr in node_set]
+        for node in community_nodes
+    }
 
-    for node in community_nodes:
-        in_neighbors_comm[node] = [
-            nbr for nbr in raw_data.in_neighbors[node]
-            if nbr in node_set
-        ]
-        out_neighbors_comm[node] = [
-            nbr for nbr in raw_data.out_neighbors[node]
-            if nbr in node_set
-        ]
-
-    hub = {}
-    authority = {}
-
-    for node in community_nodes:
-        hub[node] = 1.0
-        authority[node] = 1.0
+    hub = {node: 1.0 for node in community_nodes}
+    authority = {node: 1.0 for node in community_nodes}
 
     for _ in range(max_iter):
         new_authority = {}
         for node in community_nodes:
-            score = 0.0
+            value = 0.0
             for nbr in in_neighbors_comm[node]:
-                score = score + base_risk_map[nbr] * hub[nbr]
-            new_authority[node] = score
+                value += base_risk_map[nbr] * hub[nbr]
+            new_authority[node] = value
 
-        auth_norm = math.sqrt(sum(val * val for val in new_authority.values()))
+        auth_norm = math.sqrt(sum(v * v for v in new_authority.values()))
         if auth_norm > 0:
             for node in community_nodes:
-                new_authority[node] = new_authority[node] / auth_norm
+                new_authority[node] /= auth_norm
 
         new_hub = {}
         for node in community_nodes:
-            score = 0.0
+            value = 0.0
             for nbr in out_neighbors_comm[node]:
-                score = score + base_risk_map[nbr] * new_authority[nbr]
-            new_hub[node] = score
+                value += base_risk_map[nbr] * new_authority[nbr]
+            new_hub[node] = value
 
-        hub_norm = math.sqrt(sum(val * val for val in new_hub.values()))
+        hub_norm = math.sqrt(sum(v * v for v in new_hub.values()))
         if hub_norm > 0:
             for node in community_nodes:
-                new_hub[node] = new_hub[node] / hub_norm
+                new_hub[node] /= hub_norm
 
         diff = 0.0
         for node in community_nodes:
-            diff = diff + abs(new_authority[node] - authority[node])
-            diff = diff + abs(new_hub[node] - hub[node])
+            diff += abs(new_authority[node] - authority[node])
+            diff += abs(new_hub[node] - hub[node])
 
         authority = new_authority
         hub = new_hub
@@ -870,6 +1118,69 @@ def compute_community_hits_refinement(
     )
 
 
+def compute_shap_feature_importance(model, X_background, X_explain, feature_names):
+    """
+    Compute SHAP explanations for the PyTorch final model.
+
+    SHAP explains how each feature pushes an individual prediction up or down.
+    Global importance is mean absolute SHAP value across explained transactions.
+    This explains model output, not accuracy directly.
+    """
+    if shap is None:
+        raise ImportError(
+            "The 'shap' package is not installed. Install it with: pip install shap"
+        )
+
+    model.eval()
+
+    background = torch.tensor(X_background, dtype=torch.float32)
+    explain_tensor = torch.tensor(X_explain, dtype=torch.float32)
+
+    class ShapModelWrapper(nn.Module):
+        def __init__(self, base_model):
+            super().__init__()
+            self.base_model = base_model
+
+        def forward(self, x):
+            return self.base_model(x).unsqueeze(1)
+
+    shap_model = ShapModelWrapper(model)
+
+    explainer = shap.DeepExplainer(shap_model, background)
+    shap_values = explainer.shap_values(explain_tensor)
+
+    if isinstance(shap_values, list):
+        shap_values = shap_values[0]
+
+    shap_values = np.asarray(shap_values)
+
+    if shap_values.ndim == 3 and shap_values.shape[-1] == 1:
+        shap_values = shap_values[:, :, 0]
+    elif shap_values.ndim == 3 and shap_values.shape[0] == 1:
+        shap_values = shap_values[0]
+
+    if shap_values.ndim != 2:
+        raise ValueError(f"Unexpected SHAP output shape: {shap_values.shape}")
+
+    if shap_values.shape[1] != len(feature_names):
+        raise ValueError(
+            f"SHAP feature dimension {shap_values.shape[1]} does not match "
+            f"{len(feature_names)} feature names."
+        )
+
+    mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
+
+    importance_df = pd.DataFrame({
+        "feature": feature_names,
+        "mean_abs_shap": mean_abs_shap,
+    }).sort_values(
+        "mean_abs_shap",
+        ascending=False
+    ).reset_index(drop=True)
+
+    return importance_df, shap_values
+
+
 if __name__ == "__main__":
     random.seed(SEED)
     np.random.seed(SEED)
@@ -878,224 +1189,444 @@ if __name__ == "__main__":
     raw_data = load_elliptic_raw(
         classes_path=CLASSES_PATH,
         edgelist_path=EDGELIST_PATH,
-        features_path=FEATURES_PATH
+        features_path=FEATURES_PATH,
     )
 
     print("Building graph features")
     features_df = compute_graph_features(raw_data)
 
-    print("\n GRAPH FEATURES BUILT")
-    print(features_df.head())
-    print()
-    print("Shape:", features_df.shape)
-    print()
-
     labeled_df = features_df[features_df["label_binary"].notna()].copy()
     labeled_df["target"] = labeled_df["label_binary"].astype(int)
 
-    print(" LABEL SUMMARY ")
     print("Total rows      :", len(features_df))
     print("Labeled rows    :", len(labeled_df))
     print("Illicit labeled :", int((labeled_df["target"] == 1).sum()))
     print("Licit labeled   :", int((labeled_df["target"] == 0).sum()))
-    print()
 
     train_df, test_df = train_test_split(
         labeled_df,
         test_size=TEST_SIZE,
         random_state=SEED,
-        stratify=labeled_df["target"]
+        stratify=labeled_df["target"],
     )
 
-    train_txids = set(train_df["txId"].astype(int).tolist())
-    test_txids = set(test_df["txId"].astype(int).tolist())
+    train_df, validation_df = train_test_split(
+        train_df,
+        test_size=VALIDATION_SIZE,
+        random_state=SEED,
+        stratify=train_df["target"],
+    )
 
-    print("FIXED SPLIT STATS ")
-    print("Train size     :", len(train_df))
-    print("Test size      :", len(test_df))
-    print("Train illicit  :", int((train_df["target"] == 1).sum()))
-    print("Train licit    :", int((train_df["target"] == 0).sum()))
-    print("Test illicit   :", int((test_df["target"] == 1).sum()))
-    print("Test licit     :", int((test_df["target"] == 0).sum()))
-    print()
+    train_txids = set(train_df["txId"].astype(int))
+    validation_txids = set(validation_df["txId"].astype(int))
+    test_txids = set(test_df["txId"].astype(int))
 
-    labeled_df = features_df[features_df["label_binary"].notna()].copy()
-    labeled_df["target"] = labeled_df["label_binary"].astype(int)
+    print("Running community detection...")
 
-    train_df = labeled_df[labeled_df["txId"].astype(int).isin(train_txids)].copy()
-    test_df = labeled_df[labeled_df["txId"].astype(int).isin(test_txids)].copy()
+    adjacency = build_undirected_adjacency(raw_data)
+
+    partition = run_louvain_local_communities(
+        adjacency=adjacency,
+        max_passes=COMMUNITY_MAX_PASSES,
+        gamma=COMMUNITY_GAMMA,
+    )
+
+    features_df = compute_graph_features(raw_data, partition=partition)
+
+
+    print("\nBUILDING LEAKAGE-SAFE BASE RISK SCORES")
+
+    HITS_FEATURE_NAMES = {
+        "community_hub_score",
+        "community_authority_score",
+        "community_hits_score",
+        "community_refined_risk",
+        "base_risk_score",
+    }
 
     base_feature_columns = [
-        col for col in labeled_df.columns
+        col for col in features_df.columns
         if col not in {
             "txId",
             "label",
             "label_binary",
             "target",
-        }
+            "community_id",
+        } and col not in HITS_FEATURE_NAMES
     ]
-
-    X_train_base = train_df[base_feature_columns].fillna(0.0).values.astype(np.float32)
-    y_train_base = train_df["target"].values.astype(np.float32)
-
-    X_test_base = test_df[base_feature_columns].fillna(0.0).values.astype(np.float32)
-    y_test_base = test_df["target"].values.astype(np.float32)
-
-    base_scaler = StandardScaler()
-    X_train_base = base_scaler.fit_transform(X_train_base).astype(np.float32)
-    X_test_base = base_scaler.transform(X_test_base).astype(np.float32)
-
-    with open(BASE_SCALER_PATH, "wb") as f:
-        pickle.dump(base_scaler, f)
 
     with open(BASE_FEATURE_COLS_PATH, "wb") as f:
         pickle.dump(base_feature_columns, f)
 
-    print(" TRAINING BASE MODEL ")
-    base_model, base_best_epoch, base_best_test_loss = train_model_with_resume(
-        X_train_base,
-        y_train_base,
-        X_test_base,
-        y_test_base,
-        checkpoint_path=BASE_CHECKPOINT_PATH,
-        best_model_path=BASE_BEST_MODEL_PATH,
-        epochs=BASE_EPOCHS,
-        lr=LR,
-        hidden_dims=(128, 64),
-        dropout=0.2,
-        model_name="base_model",
+    print("Number of base-model features:", len(base_feature_columns))
+
+    def get_scaled_matrix(df, columns, scaler):
+        X = df[columns].fillna(0.0).values.astype(np.float32)
+        return scaler.transform(X).astype(np.float32)
+
+    def train_base_and_score(
+        base_train_df,
+        base_validation_df,
+        score_df,
+        epochs,
+        run_name,
+    ):
+        X_base_train = base_train_df[base_feature_columns].fillna(0.0).values.astype(np.float32)
+        y_base_train = base_train_df["target"].values.astype(np.float32)
+
+        X_base_val = base_validation_df[base_feature_columns].fillna(0.0).values.astype(np.float32)
+        y_base_val = base_validation_df["target"].values.astype(np.float32)
+
+        scaler = StandardScaler()
+        X_base_train = scaler.fit_transform(X_base_train).astype(np.float32)
+        X_base_val = scaler.transform(X_base_val).astype(np.float32)
+
+        model, best_epoch, best_loss = train_model(
+            X_base_train,
+            y_base_train,
+            X_base_val,
+            y_base_val,
+            epochs=epochs,
+            lr=LR,
+            hidden_dims=(256, 128, 64),
+            dropout=0.25,
+        )
+
+        X_score = score_df[base_feature_columns].fillna(0.0).values.astype(np.float32)
+        X_score = scaler.transform(X_score).astype(np.float32)
+
+        model.eval()
+        with torch.no_grad():
+            logits = model(torch.tensor(X_score, dtype=torch.float32))
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+        print(
+            f"{run_name}: best epoch={best_epoch}, "
+            f"best validation loss={best_loss:.4f}"
+        )
+
+        return probs
+
+    all_node_ids = features_df["txId"].astype(int).tolist()
+    train_array = train_df.reset_index(drop=True)
+    train_y = train_array["target"].astype(int).values
+
+    skf = StratifiedKFold(
+        n_splits=OOF_FOLDS,
+        shuffle=True,
+        random_state=SEED,
     )
 
-    print()
-    print("Best base-model epoch     :", base_best_epoch)
-    print(f"Best base-model test loss : {base_best_test_loss:.4f}")
-    print()
+    fold_risk_maps = {}
 
-    X_all_base = features_df[base_feature_columns].fillna(0.0).values.astype(np.float32)
-    X_all_base = base_scaler.transform(X_all_base).astype(np.float32)
-    X_all_base_tensor = torch.tensor(X_all_base, dtype=torch.float32)
-
-    base_model.eval()
-    with torch.no_grad():
-        base_logits_all = base_model(X_all_base_tensor)
-        base_probs_all = torch.sigmoid(base_logits_all).cpu().numpy()
-
-    features_df["base_risk_score"] = base_probs_all
-
-    print("Running community detection...")
-    adjacency = build_undirected_adjacency(raw_data)
-    partition = run_louvain_local_communities(
-        adjacency=adjacency,
-        max_passes=COMMUNITY_MAX_PASSES,
-        gamma=COMMUNITY_GAMMA
+    print(
+        f"Generating {OOF_FOLDS}-fold out-of-fold base risks "
+        "and risk-aware HITS in one pass..."
     )
 
-    base_risk_map = {}
-    for row in features_df.itertuples(index=False):
-        base_risk_map[int(row.txId)] = float(row.base_risk_score)
+    train_fold_by_txid = {}
+    for fold_id, (_, holdout_idx) in enumerate(
+        skf.split(train_array, train_y), start=1
+    ):
+        for txid in train_array.iloc[holdout_idx]["txId"].astype(int):
+            train_fold_by_txid[int(txid)] = fold_id
+
+    for fold_id, (fit_idx, holdout_idx) in enumerate(
+        skf.split(train_array, train_y), start=1
+    ):
+        fold_fit_df = train_array.iloc[fit_idx].copy()
+        fold_holdout_df = train_array.iloc[holdout_idx].copy()
+
+        fold_scores = train_base_and_score(
+            base_train_df=fold_fit_df,
+            base_validation_df=fold_holdout_df,
+            score_df=features_df,
+            epochs=BASE_OOF_EPOCHS,
+            run_name=f"OOF fold {fold_id}/{OOF_FOLDS}",
+        )
+
+        fold_risk_maps[fold_id] = dict(zip(all_node_ids, fold_scores))
+
+    fully_oof_risk_map = {}
+
+    for txid in train_df["txId"].astype(int):
+        txid = int(txid)
+        fold_id = train_fold_by_txid[txid]
+        fully_oof_risk_map[txid] = fold_risk_maps[fold_id][txid]
+
+    if len(fully_oof_risk_map) != len(train_df):
+        raise RuntimeError(
+            "Fully OOF risk map failed: every training node must receive "
+            "exactly one out-of-fold base-risk prediction."
+        )
+
+    print(
+        "\nTraining one full base model for validation/test scoring..."
+    )
+
+    full_base_scores = train_base_and_score(
+        base_train_df=train_df,
+        base_validation_df=validation_df,
+        score_df=features_df,
+        epochs=EPOCHS,
+        run_name="Full base model",
+    )
+
+    full_base_score_map = dict(zip(all_node_ids, full_base_scores))
+
+    training_hits_risk_map = dict(full_base_score_map)
+    training_hits_risk_map.update(fully_oof_risk_map)
+
+    def compute_risk_hits_for_risk_map(base_risk_map):
+        (
+            community_size_by_cid,
+            community_hub_score,
+            community_authority_score,
+            community_hits_score,
+            community_refined_risk,
+        ) = compute_community_hits_refinement(
+            partition=partition,
+            raw_data=raw_data,
+            base_risk_map=base_risk_map,
+            lam=LAMBDA_COMMUNITY,
+            max_iter=COMMUNITY_HITS_MAX_ITER,
+            tol=COMMUNITY_HITS_TOL,
+        )
+
+        return (
+            community_size_by_cid,
+            community_hub_score,
+            community_authority_score,
+            community_hits_score,
+            community_refined_risk,
+        )
 
     (
-        community_size_by_cid,
-        community_hub_score,
-        community_authority_score,
-        community_hits_score,
-        community_refined_risk,
-    ) = compute_community_hits_refinement(
-        partition=partition,
-        raw_data=raw_data,
-        base_risk_map=base_risk_map,
-        lam=LAMBDA_COMMUNITY,
-        max_iter=COMMUNITY_HITS_MAX_ITER,
-        tol=COMMUNITY_HITS_TOL,
+        train_comm_size,
+        train_hub,
+        train_auth,
+        train_hits,
+        train_refined,
+    ) = compute_risk_hits_for_risk_map(training_hits_risk_map)
+
+    train_risk_hits = {}
+
+    for txid in train_df["txId"].astype(int):
+        txid = int(txid)
+        train_risk_hits[txid] = {
+            "base_risk_score": fully_oof_risk_map[txid],
+            "community_hub_score": train_hub[txid],
+            "community_authority_score": train_auth[txid],
+            "community_hits_score": train_hits[txid],
+            "community_refined_risk": train_refined[txid],
+            "community_size": train_comm_size[partition[txid]],
+        }
+
+    if len(train_risk_hits) != len(train_df):
+        raise RuntimeError(
+            "OOF HITS generation failed: not every training node received "
+            "exactly one leakage-safe HITS feature set."
+        )
+
+    (
+        validation_comm_size,
+        validation_hub,
+        validation_auth,
+        validation_hits,
+        validation_refined,
+    ) = compute_risk_hits_for_risk_map(full_base_score_map)
+
+    validation_risk_hits = {}
+
+    for txid in validation_df["txId"].astype(int):
+        txid = int(txid)
+        validation_risk_hits[txid] = {
+            "base_risk_score": full_base_score_map[txid],
+            "community_hub_score": validation_hub[txid],
+            "community_authority_score": validation_auth[txid],
+            "community_hits_score": validation_hits[txid],
+            "community_refined_risk": validation_refined[txid],
+            "community_size": validation_comm_size[partition[txid]],
+        }
+
+    (
+        test_comm_size,
+        test_hub,
+        test_auth,
+        test_hits,
+        test_refined,
+    ) = compute_risk_hits_for_risk_map(full_base_score_map)
+
+    test_risk_hits = {}
+
+    for txid in test_df["txId"].astype(int):
+        txid = int(txid)
+        test_risk_hits[txid] = {
+            "base_risk_score": full_base_score_map[txid],
+            "community_hub_score": test_hub[txid],
+            "community_authority_score": test_auth[txid],
+            "community_hits_score": test_hits[txid],
+            "community_refined_risk": test_refined[txid],
+            "community_size": test_comm_size[partition[txid]],
+        }
+
+    for feature_name in [
+        "base_risk_score",
+        "community_hub_score",
+        "community_authority_score",
+        "community_hits_score",
+        "community_refined_risk",
+    ]:
+        values = []
+        for txid in features_df["txId"].astype(int):
+            if txid in train_risk_hits:
+                values.append(train_risk_hits[txid][feature_name])
+            elif txid in validation_risk_hits:
+                values.append(validation_risk_hits[txid][feature_name])
+            elif txid in test_risk_hits:
+                values.append(test_risk_hits[txid][feature_name])
+            else:
+                values.append(full_base_score_map.get(txid, 0.0))
+
+        features_df[feature_name] = values
+
+    print("\nRISK-AWARE HITS FEATURES ADDED")
+    print("base_risk_score")
+    print("community_hub_score")
+    print("community_authority_score")
+    print("community_hits_score")
+    print("community_refined_risk")
+
+
+    risk_by_txid = dict(
+        zip(
+            features_df["txId"].astype(int),
+            features_df["base_risk_score"].astype(float),
+        )
     )
 
-    community_id_col = []
-    community_size_col = []
-    community_hub_col = []
-    community_auth_col = []
-    community_hits_col = []
-    community_refined_risk_col = []
+    in_neighbor_mean_base_risk = {}
+    in_neighbor_max_base_risk = {}
+    out_neighbor_mean_base_risk = {}
+    risk_weighted_in_degree = {}
 
-    for row in features_df.itertuples(index=False):
-        node = int(row.txId)
-        cid = partition[node]
+    for node in features_df["txId"].astype(int):
+        in_neighbors = raw_data.in_neighbors.get(int(node), [])
+        out_neighbors = raw_data.out_neighbors.get(int(node), [])
 
-        community_id_col.append(cid)
-        community_size_col.append(community_size_by_cid[cid])
-        community_hub_col.append(community_hub_score[node])
-        community_auth_col.append(community_authority_score[node])
-        community_hits_col.append(community_hits_score[node])
-        community_refined_risk_col.append(community_refined_risk[node])
+        in_risks = [
+            risk_by_txid.get(int(nbr), 0.0)
+            for nbr in in_neighbors
+        ]
+        out_risks = [
+            risk_by_txid.get(int(nbr), 0.0)
+            for nbr in out_neighbors
+        ]
 
-    features_df["community_id"] = community_id_col
-    features_df["community_size"] = community_size_col
-    features_df["community_hub_score"] = community_hub_col
-    features_df["community_authority_score"] = community_auth_col
-    features_df["community_hits_score"] = community_hits_col
-    features_df["community_refined_risk"] = community_refined_risk_col
+        in_neighbor_mean_base_risk[int(node)] = (
+            float(np.mean(in_risks)) if in_risks else 0.0
+        )
+        in_neighbor_max_base_risk[int(node)] = (
+            float(max(in_risks)) if in_risks else 0.0
+        )
+        out_neighbor_mean_base_risk[int(node)] = (
+            float(np.mean(out_risks)) if out_risks else 0.0
+        )
 
-    print("Community HITS features added.")
-    print()
+        risk_weighted_in_degree[int(node)] = float(sum(in_risks))
+
+    features_df["in_neighbor_mean_base_risk"] = [
+        in_neighbor_mean_base_risk[int(txid)]
+        for txid in features_df["txId"].astype(int)
+    ]
+    features_df["in_neighbor_max_base_risk"] = [
+        in_neighbor_max_base_risk[int(txid)]
+        for txid in features_df["txId"].astype(int)
+    ]
+    features_df["out_neighbor_mean_base_risk"] = [
+        out_neighbor_mean_base_risk[int(txid)]
+        for txid in features_df["txId"].astype(int)
+    ]
+    features_df["risk_weighted_in_degree"] = [
+        risk_weighted_in_degree[int(txid)]
+        for txid in features_df["txId"].astype(int)
+    ]
+
+    print("\nBASE-RISK NEIGHBOR FEATURES ADDED")
+    print("in_neighbor_mean_base_risk")
+    print("in_neighbor_max_base_risk")
+    print("out_neighbor_mean_base_risk")
+    print("risk_weighted_in_degree")
 
     labeled_df = features_df[features_df["label_binary"].notna()].copy()
     labeled_df["target"] = labeled_df["label_binary"].astype(int)
 
-    train_df = labeled_df[labeled_df["txId"].astype(int).isin(train_txids)].copy()
-    test_df = labeled_df[labeled_df["txId"].astype(int).isin(test_txids)].copy()
+    train_df = labeled_df[
+        labeled_df["txId"].astype(int).isin(train_txids)
+    ].copy()
+    validation_df = labeled_df[
+        labeled_df["txId"].astype(int).isin(validation_txids)
+    ].copy()
+    test_df = labeled_df[
+        labeled_df["txId"].astype(int).isin(test_txids)
+    ].copy()
 
-    final_feature_columns = [
+    feature_columns = [
         col for col in labeled_df.columns
         if col not in {
             "txId",
             "label",
             "label_binary",
             "target",
-            "flow_uncertainty_score",
+            "community_id",
         }
     ]
 
-    print(" FINAL FEATURE COLUMNS")
-    for col in final_feature_columns:
+    print("\nFINAL FEATURE COLUMNS")
+    for col in feature_columns:
         print(col)
-    print()
-    print("Number of final features:", len(final_feature_columns))
-    print()
+    print("Number of final features:", len(feature_columns))
 
-    X_train = train_df[final_feature_columns].fillna(0.0).values.astype(np.float32)
+    X_train = train_df[feature_columns].fillna(0.0).values.astype(np.float32)
     y_train = train_df["target"].values.astype(np.float32)
 
-    X_test = test_df[final_feature_columns].fillna(0.0).values.astype(np.float32)
+    X_validation = (
+        validation_df[feature_columns].fillna(0.0).values.astype(np.float32)
+    )
+    y_validation = validation_df["target"].values.astype(np.float32)
+
+    X_test = test_df[feature_columns].fillna(0.0).values.astype(np.float32)
     y_test = test_df["target"].values.astype(np.float32)
 
     final_scaler = StandardScaler()
     X_train = final_scaler.fit_transform(X_train).astype(np.float32)
+    X_validation = final_scaler.transform(X_validation).astype(np.float32)
     X_test = final_scaler.transform(X_test).astype(np.float32)
 
     with open(FINAL_SCALER_PATH, "wb") as f:
         pickle.dump(final_scaler, f)
 
     with open(FINAL_FEATURE_COLS_PATH, "wb") as f:
-        pickle.dump(final_feature_columns, f)
+        pickle.dump(feature_columns, f)
 
-    print(" TRAINING FINAL MODEL ")
-    final_model, final_best_epoch, final_best_test_loss = train_model_with_resume(
+    print("\nTRAINING SINGLE FINAL MODEL")
+
+    final_model, final_best_epoch, final_best_validation_loss = train_model(
         X_train,
         y_train,
-        X_test,
-        y_test,
-        checkpoint_path=FINAL_CHECKPOINT_PATH,
-        best_model_path=FINAL_BEST_MODEL_PATH,
-        epochs=FINAL_EPOCHS,
+        X_validation,
+        y_validation,
+        epochs=EPOCHS,
         lr=LR,
         hidden_dims=(256, 128, 64),
         dropout=0.25,
-        model_name="final_model",
     )
 
-    print()
-    print("Best final-model epoch     :", final_best_epoch)
-    print(f"Best final-model test loss : {final_best_test_loss:.4f}")
-    print()
+    print("Best model epoch:", final_best_epoch)
+    print(
+        "Best model validation loss:",
+        f"{final_best_validation_loss:.4f}",
+    )
 
     X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
 
@@ -1104,48 +1635,84 @@ if __name__ == "__main__":
         test_logits = final_model(X_test_tensor)
         test_probs = torch.sigmoid(test_logits).cpu().numpy()
 
-    test_preds = (test_probs >= 0.5).astype(int)
+    test_preds = (test_probs >= 0.7).astype(int)
 
     cm = confusion_matrix(y_test.astype(int), test_preds)
-    report = classification_report(y_test.astype(int), test_preds, digits=4)
+    report = classification_report(
+        y_test.astype(int), test_preds, digits=4
+    )
     roc_auc = roc_auc_score(y_test.astype(int), test_probs)
 
-    print(" FINAL TEST RESULTS ")
+    print("\nFINAL TEST RESULTS")
     print("CONFUSION MATRIX")
     print(cm)
-    print()
-    print(" CLASSIFICATION REPORT ")
+    print("\nCLASSIFICATION REPORT")
     print(report)
     print(f"ROC-AUC: {roc_auc:.4f}")
 
+    print("\nCOMPUTING SHAP FEATURE IMPORTANCE")
+
+    SHAP_BACKGROUND_SIZE = min(50, len(X_train))
+    SHAP_EXPLAIN_SIZE = min(100, len(X_test))
+
+    shap_background = X_train[:SHAP_BACKGROUND_SIZE]
+
+    if len(X_test) > SHAP_EXPLAIN_SIZE:
+        shap_indices = np.linspace(
+            0, len(X_test) - 1, SHAP_EXPLAIN_SIZE, dtype=int
+        )
+        shap_explain = X_test[shap_indices]
+        shap_txids = test_df.iloc[shap_indices]["txId"].astype(int).values
+    else:
+        shap_explain = X_test
+        shap_txids = test_df["txId"].astype(int).values
+
+    shap_importance_df, shap_values = compute_shap_feature_importance(
+        model=final_model,
+        X_background=shap_background,
+        X_explain=shap_explain,
+        feature_names=feature_columns,
+    )
+
+    shap_importance_df.to_csv(SHAP_IMPORTANCE_PATH, index=False)
+
+    shap_values_df = pd.DataFrame(
+        shap_values,
+        columns=feature_columns,
+    )
+    shap_values_df.insert(0, "txId", shap_txids)
+    shap_values_df.to_csv(SHAP_VALUES_PATH, index=False)
+
+    print("\nTOP SHAP FEATURES")
+    print(shap_importance_df.head(15).to_string(index=False))
+
     features_df.to_csv(FINAL_FEATURES_OUTPUT_PATH, index=False)
 
-    X_all_final = features_df[final_feature_columns].fillna(0.0).values.astype(np.float32)
-    X_all_final = final_scaler.transform(X_all_final).astype(np.float32)
-    X_all_final_tensor = torch.tensor(X_all_final, dtype=torch.float32)
+    X_all = features_df[feature_columns].fillna(0.0).values.astype(np.float32)
+    X_all = final_scaler.transform(X_all).astype(np.float32)
+    X_all_tensor = torch.tensor(X_all, dtype=torch.float32)
 
     final_model.eval()
     with torch.no_grad():
-        all_logits = final_model(X_all_final_tensor)
+        all_logits = final_model(X_all_tensor)
         all_probs = torch.sigmoid(all_logits).cpu().numpy()
 
     final_scores_df = pd.DataFrame({
         "txId": features_df["txId"].astype(int),
-        "final_risk_score": all_probs
+        "final_risk_score": all_probs,
     })
     final_scores_df.to_csv(FINAL_SCORES_PATH, index=False)
 
-    print()
-    print(" SAVED ARTIFACTS ")
-    print("Base checkpoint      :", BASE_CHECKPOINT_PATH)
-    print("Base best model      :", BASE_BEST_MODEL_PATH)
-    print("Base scaler          :", BASE_SCALER_PATH)
-    print("Base feature cols    :", BASE_FEATURE_COLS_PATH)
-    print("Final checkpoint     :", FINAL_CHECKPOINT_PATH)
-    print("Final best model     :", FINAL_BEST_MODEL_PATH)
-    print("Final scaler         :", FINAL_SCALER_PATH)
-    print("Final feature cols   :", FINAL_FEATURE_COLS_PATH)
-    print("All features CSV     :", FINAL_FEATURES_OUTPUT_PATH)
-    print("Final risk scores    :", FINAL_SCORES_PATH)
-    print()
-    print("Done.")
+    base_risk_output = pd.DataFrame({
+        "txId": features_df["txId"].astype(int),
+        "base_risk_score": features_df["base_risk_score"].astype(float),
+    })
+    base_risk_output.to_csv(BASE_RISK_OUTPUT_PATH, index=False)
+
+    print("\nSAVED ARTIFACTS")
+    print("Final scaler     :", FINAL_SCALER_PATH)
+    print("Final feature cols:", FINAL_FEATURE_COLS_PATH)
+    print("All features CSV :", FINAL_FEATURES_OUTPUT_PATH)
+    print("Final risk scores :", FINAL_SCORES_PATH)
+    print("Base risk scores  :", BASE_RISK_OUTPUT_PATH)
+    print("\nDone.")
