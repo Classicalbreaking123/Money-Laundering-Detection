@@ -16,10 +16,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
 
 
-try:
-    import shap
-except ImportError:
-    shap = None
 
 
 SEED = 42
@@ -59,8 +55,6 @@ BASE_FEATURE_COLS_PATH = ARTIFACT_DIR / "base_feature_columns.pkl"
 FINAL_FEATURES_OUTPUT_PATH = ARTIFACT_DIR / "all_features_with_custom.csv"
 FINAL_SCORES_PATH = ARTIFACT_DIR / "final_all_risk_scores.csv"
 BASE_RISK_OUTPUT_PATH = ARTIFACT_DIR / "base_risk_scores.csv"
-SHAP_IMPORTANCE_PATH = ARTIFACT_DIR / "shap_feature_importance.csv"
-SHAP_VALUES_PATH = ARTIFACT_DIR / "shap_test_values.csv"
 
 
 @dataclass
@@ -1077,69 +1071,6 @@ def compute_community_features(
     )
 
 
-def compute_shap_feature_importance(model, X_background, X_explain, feature_names):
-    """
-    Compute SHAP explanations for the PyTorch final model.
-
-    SHAP explains how each feature pushes an individual prediction up or down.
-    Global importance is mean absolute SHAP value across explained transactions.
-    This explains model output, not accuracy directly.
-    """
-    if shap is None:
-        raise ImportError(
-            "The 'shap' package is not installed. Install it with: pip install shap"
-        )
-
-    model.eval()
-
-    background = torch.tensor(X_background, dtype=torch.float32)
-    explain_tensor = torch.tensor(X_explain, dtype=torch.float32)
-
-    class ShapModelWrapper(nn.Module):
-        def __init__(self, base_model):
-            super().__init__()
-            self.base_model = base_model
-
-        def forward(self, x):
-            return self.base_model(x).unsqueeze(1)
-
-    shap_model = ShapModelWrapper(model)
-
-    explainer = shap.DeepExplainer(shap_model, background)
-    shap_values = explainer.shap_values(explain_tensor)
-
-    if isinstance(shap_values, list):
-        shap_values = shap_values[0]
-
-    shap_values = np.asarray(shap_values)
-
-    if shap_values.ndim == 3 and shap_values.shape[-1] == 1:
-        shap_values = shap_values[:, :, 0]
-    elif shap_values.ndim == 3 and shap_values.shape[0] == 1:
-        shap_values = shap_values[0]
-
-    if shap_values.ndim != 2:
-        raise ValueError(f"Unexpected SHAP output shape: {shap_values.shape}")
-
-    if shap_values.shape[1] != len(feature_names):
-        raise ValueError(
-            f"SHAP feature dimension {shap_values.shape[1]} does not match "
-            f"{len(feature_names)} feature names."
-        )
-
-    mean_abs_shap = np.mean(np.abs(shap_values), axis=0)
-
-    importance_df = pd.DataFrame({
-        "feature": feature_names,
-        "mean_abs_shap": mean_abs_shap,
-    }).sort_values(
-        "mean_abs_shap",
-        ascending=False
-    ).reset_index(drop=True)
-
-    return importance_df, shap_values
-
-
 if __name__ == "__main__":
     random.seed(SEED)
     np.random.seed(SEED)
@@ -1658,70 +1589,3 @@ if __name__ == "__main__":
     print("\nCLASSIFICATION REPORT")
     print(report)
     print(f"ROC-AUC: {roc_auc:.4f}")
-
-    print("\nCOMPUTING SHAP FEATURE IMPORTANCE")
-
-    SHAP_BACKGROUND_SIZE = min(50, len(X_train))
-    SHAP_EXPLAIN_SIZE = min(100, len(X_test))
-
-    shap_background = X_train[:SHAP_BACKGROUND_SIZE]
-
-    if len(X_test) > SHAP_EXPLAIN_SIZE:
-        shap_indices = np.linspace(
-            0, len(X_test) - 1, SHAP_EXPLAIN_SIZE, dtype=int
-        )
-        shap_explain = X_test[shap_indices]
-        shap_txids = test_df.iloc[shap_indices]["txId"].astype(int).values
-    else:
-        shap_explain = X_test
-        shap_txids = test_df["txId"].astype(int).values
-
-    shap_importance_df, shap_values = compute_shap_feature_importance(
-        model=final_model,
-        X_background=shap_background,
-        X_explain=shap_explain,
-        feature_names=feature_columns,
-    )
-
-    shap_importance_df.to_csv(SHAP_IMPORTANCE_PATH, index=False)
-
-    shap_values_df = pd.DataFrame(
-        shap_values,
-        columns=feature_columns,
-    )
-    shap_values_df.insert(0, "txId", shap_txids)
-    shap_values_df.to_csv(SHAP_VALUES_PATH, index=False)
-
-    print("\nTOP SHAP FEATURES")
-    print(shap_importance_df.head(15).to_string(index=False))
-
-    features_df.to_csv(FINAL_FEATURES_OUTPUT_PATH, index=False)
-
-    X_all = features_df[feature_columns].fillna(0.0).values.astype(np.float32)
-    X_all = final_scaler.transform(X_all).astype(np.float32)
-    X_all_tensor = torch.tensor(X_all, dtype=torch.float32)
-
-    final_model.eval()
-    with torch.no_grad():
-        all_logits = final_model(X_all_tensor)
-        all_probs = torch.sigmoid(all_logits).cpu().numpy()
-
-    final_scores_df = pd.DataFrame({
-        "txId": features_df["txId"].astype(int),
-        "final_risk_score": all_probs,
-    })
-    final_scores_df.to_csv(FINAL_SCORES_PATH, index=False)
-
-    base_risk_output = pd.DataFrame({
-        "txId": features_df["txId"].astype(int),
-        "base_risk_score": features_df["base_risk_score"].astype(float),
-    })
-    base_risk_output.to_csv(BASE_RISK_OUTPUT_PATH, index=False)
-
-    print("\nSAVED ARTIFACTS")
-    print("Final scaler     :", FINAL_SCALER_PATH)
-    print("Final feature cols:", FINAL_FEATURE_COLS_PATH)
-    print("All features CSV :", FINAL_FEATURES_OUTPUT_PATH)
-    print("Final risk scores :", FINAL_SCORES_PATH)
-    print("Base risk scores  :", BASE_RISK_OUTPUT_PATH)
-    print("\nDone.")
