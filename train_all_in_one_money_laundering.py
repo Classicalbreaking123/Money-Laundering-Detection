@@ -994,18 +994,7 @@ def compute_risk_aware_hits_for_community(
     max_iter=50,
     tol=1e-8,
 ):
-    """
-    Risk-aware HITS.
-
-    Authority receives weighted contributions from incoming hubs:
-        A_i = sum_j [ risk(j) * H_j ]
-
-    Hub receives weighted contributions from outgoing authorities:
-        H_i = sum_j [ risk(j) * A_j ]
-
-    The base-risk map is supplied externally. Leakage-safe construction of
-    that map is handled by the OOF pipeline in main().
-    """
+   
     node_set = set(community_nodes)
 
     in_neighbors_comm = {
@@ -1119,13 +1108,7 @@ def compute_community_hits_refinement(
 
 
 def compute_shap_feature_importance(model, X_background, X_explain, feature_names):
-    """
-    Compute SHAP explanations for the PyTorch final model.
 
-    SHAP explains how each feature pushes an individual prediction up or down.
-    Global importance is mean absolute SHAP value across explained transactions.
-    This explains model output, not accuracy directly.
-    """
     if shap is None:
         raise ImportError(
             "The 'shap' package is not installed. Install it with: pip install shap"
