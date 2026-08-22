@@ -35,9 +35,7 @@ BASE_OOF_EPOCHS = 300
 OOF_FOLDS = 5
 LR = 1e-3
 
-DFER_BETA = 0.8
-DFER_ALPHA = 0.5
-DFER_GAMMA = 0.1
+DFER_BETA = 0.5
 DFER_MAX_ITER = 30
 DFER_TOL = 1e-8
 
@@ -298,98 +296,47 @@ def compute_temporal_burst_entropy_score(raw_data, node_ids):
 
 def compute_discounted_flow_entropy_rate(
     raw_data,
-    beta=0.8,
-    alpha=0.5,
-    gamma=0.1,
+    beta=0.5,
     max_iter=30,
     tol=1e-8,
 ):
     node_ids = raw_data.node_ids
-
-    outdegree = {}
-    two_hop_reach = {}
+    local_entropy = {}
 
     for node in node_ids:
-        out_neighbors = raw_data.out_neighbors[node]
-        outdegree[node] = len(out_neighbors)
+        d = len(raw_data.out_neighbors[node])
+        if d == 0:
+            local_entropy[node] = 0.0
+        else:
+            local_entropy[node] = math.log2(d)
 
-    for node in node_ids:
-        first_hop = raw_data.out_neighbors[node]
-        two_hop_nodes = set()
-
-        for nbr in first_hop:
-            for nbr2 in raw_data.out_neighbors[nbr]:
-                if nbr2 != node:
-                    two_hop_nodes.add(nbr2)
-
-        two_hop_reach[node] = len(two_hop_nodes)
-
-    transition_probs = {}
-    one_step_entropy = {}
-
-    for node in node_ids:
-        children = raw_data.out_neighbors[node]
-
-        if len(children) == 0:
-            transition_probs[node] = []
-            one_step_entropy[node] = 0.0
-            continue
-
-        scores = []
-        total_score = 0.0
-
-        for child in children:
-            score = 1.0 + alpha * outdegree[child] + gamma * two_hop_reach[child]
-            scores.append((child, score))
-            total_score = total_score + score
-
-        probs = []
-        entropy = 0.0
-
-        for child, score in scores:
-            p = score / (total_score + 1e-12)
-            probs.append((child, p))
-            entropy = entropy - p * math.log(p + 1e-12)
-
-        transition_probs[node] = probs
-        one_step_entropy[node] = entropy
-
-    flow_uncertainty = {}
-    for node in node_ids:
-        flow_uncertainty[node] = one_step_entropy[node]
+    flow_uncertainty = {node: 0.0 for node in node_ids}
 
     for iteration in range(max_iter):
         new_flow_uncertainty = {}
         max_change = 0.0
 
         for node in node_ids:
-            value = one_step_entropy[node]
+            children = raw_data.out_neighbors[node]
+            value = local_entropy[node]
 
-            expected_future = 0.0
-            for child, p in transition_probs[node]:
-                expected_future = expected_future + p * flow_uncertainty[child]
+            if len(children) > 0:
+                child_sum = 0.0
+                for child in children:
+                    child_sum = child_sum + flow_uncertainty[child]
+                value = value + beta * (child_sum / len(children))
 
-            value = value + beta * expected_future
             new_flow_uncertainty[node] = value
-
             diff = abs(value - flow_uncertainty[node])
             if diff > max_change:
                 max_change = diff
 
         flow_uncertainty = new_flow_uncertainty
 
-        print(
-            f"DFER iteration {iteration + 1:02d}/{max_iter} | "
-            f"max change = {max_change:.10f}"
-        )
-
         if max_change < tol:
-            print("DFER converged early.")
             break
 
     return flow_uncertainty
-
-
 
 def compute_additional_flow_features(raw_data, node_ids, partition):
     """Compute additional fan-in, fan-out, relay, neighbor-structure,
@@ -563,8 +510,6 @@ def compute_graph_features(raw_data, partition=None):
     flow_uncertainty_map = compute_discounted_flow_entropy_rate(
         raw_data,
         beta=DFER_BETA,
-        alpha=DFER_ALPHA,
-        gamma=DFER_GAMMA,
         max_iter=DFER_MAX_ITER,
         tol=DFER_TOL,
     )
@@ -1589,3 +1534,34 @@ if __name__ == "__main__":
     print("\nCLASSIFICATION REPORT")
     print(report)
     print(f"ROC-AUC: {roc_auc:.4f}")
+
+    features_df.to_csv(FINAL_FEATURES_OUTPUT_PATH, index=False)
+
+    X_all = features_df[feature_columns].fillna(0.0).values.astype(np.float32)
+    X_all = final_scaler.transform(X_all).astype(np.float32)
+    X_all_tensor = torch.tensor(X_all, dtype=torch.float32)
+
+    final_model.eval()
+    with torch.no_grad():
+        all_logits = final_model(X_all_tensor)
+        all_probs = torch.sigmoid(all_logits).cpu().numpy()
+
+    final_scores_df = pd.DataFrame({
+        "txId": features_df["txId"].astype(int),
+        "final_risk_score": all_probs,
+    })
+    final_scores_df.to_csv(FINAL_SCORES_PATH, index=False)
+
+    base_risk_output = pd.DataFrame({
+        "txId": features_df["txId"].astype(int),
+        "base_risk_score": features_df["base_risk_score"].astype(float),
+    })
+    base_risk_output.to_csv(BASE_RISK_OUTPUT_PATH, index=False)
+
+    print("\nSAVED ARTIFACTS")
+    print("Final scaler     :", FINAL_SCALER_PATH)
+    print("Final feature cols:", FINAL_FEATURE_COLS_PATH)
+    print("All features CSV :", FINAL_FEATURES_OUTPUT_PATH)
+    print("Final risk scores :", FINAL_SCORES_PATH)
+    print("Base risk scores  :", BASE_RISK_OUTPUT_PATH)
+    print("\nDone.")
